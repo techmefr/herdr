@@ -51,6 +51,11 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+#[cfg(not(windows))]
+pub fn foreground_job_fresh(child_pid: u32) -> Option<ForegroundJob> {
+    foreground_job(child_pid)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,

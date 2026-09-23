@@ -197,6 +197,10 @@ pub fn foreground_job(_child_pid: u32) -> Option<ForegroundJob> {
     None
 }
 
+pub fn process_is_descendant_of(_pid: u32, _ancestor_pid: u32) -> bool {
+    false
+}
+
 /// Unsupported platform stub.
 pub fn foreground_group_leader_job(_process_group_id: u32) -> Option<ForegroundJob> {
     None

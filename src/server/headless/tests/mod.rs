@@ -5745,6 +5745,46 @@ fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
     assert_eq!(server.app.next_agent_manifest_update_check, None);
 }
 
+#[test]
+fn headless_scheduled_tasks_finish_codex_readiness_after_blocker() {
+    let mut server = test_headless_server();
+    server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("codex-ready")];
+    server.app.state.ensure_test_terminals();
+    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+    let terminal_id = server.app.state.workspaces[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    let at = Instant::now();
+    let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+    terminal.begin_managed_agent(
+        "codex-ready".into(),
+        crate::detect::Agent::Codex,
+        at,
+        Duration::ZERO,
+        Duration::from_secs(60),
+    );
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Codex),
+        crate::detect::AgentState::Blocked,
+    );
+    assert!(terminal.reconcile_managed_agent_at(at, false));
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Codex),
+        crate::detect::AgentState::Unknown,
+    );
+    terminal.observe_codex_prompt(true, at).unwrap();
+    assert!(terminal.managed_agent_launch_pending());
+    assert_eq!(
+        terminal.next_managed_agent_deadline(),
+        Some(at + Duration::from_secs(2))
+    );
+
+    assert!(server.handle_scheduled_tasks_headless(at + Duration::from_secs(2), false));
+    let terminal = &server.app.state.terminals[&terminal_id];
+    assert!(terminal.managed_agent_interactive_ready());
+    assert_eq!(terminal.next_managed_agent_deadline(), None);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_client() {
@@ -7374,6 +7414,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 &mut server,
                 Method::PaneReportAgentSession(PaneReportAgentSessionParams {
                     pane_id: public_pane_id.clone(),
+                    origin_pid: None,
                     source: "herdr:pi".into(),
                     agent: "pi".into(),
                     seq: Some(11),
@@ -7435,6 +7476,119 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 "the first real turn after {reason} must finish"
             );
         }
+    }
+}
+
+#[test]
+fn codex_session_report_requires_current_process_and_keeps_legacy_identity_only() {
+    let mut server = test_headless_server();
+    server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("codex-report")];
+    server.app.state.ensure_test_terminals();
+    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+    let terminal_id = server.app.state.workspaces[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    for (origin_pid, stale) in [(Some(std::process::id()), true), (None, false)] {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "codex-registration".into(),
+                method: api::schema::Method::PaneReportAgentSession(
+                    api::schema::PaneReportAgentSessionParams {
+                        pane_id: public_pane_id.clone(),
+                        origin_pid,
+                        source: "herdr:codex".into(),
+                        agent: "codex".into(),
+                        seq: None,
+                        agent_session_id: Some("session".into()),
+                        agent_session_path: Some(
+                            std::env::temp_dir()
+                                .join("session.jsonl")
+                                .display()
+                                .to_string(),
+                        ),
+                        session_start_source: None,
+                    },
+                ),
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        });
+        let response: serde_json::Value =
+            serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
+        if stale {
+            assert_eq!(response["error"]["code"], "agent_session_stale");
+            assert!(server.app.state.terminals[&terminal_id]
+                .persisted_agent_session
+                .is_none());
+        } else {
+            assert!(response.get("result").is_some());
+            assert!(server.app.state.terminals[&terminal_id]
+                .persisted_agent_session
+                .is_some());
+        }
+        assert!(server.app.state.terminals[&terminal_id]
+            .codex_session
+            .is_none());
+    }
+
+    let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+    terminal.set_agent_session_ref_for_session_start(
+        "herdr:codex".into(),
+        "codex".into(),
+        crate::agent_resume::AgentSessionRef::id("current"),
+        None,
+        Some("startup".into()),
+    );
+    terminal.register_codex_transcript(std::env::temp_dir().join("current.jsonl"));
+    for origin_pid in [None, Some(std::process::id())] {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "stale-codex-hook".into(),
+                method: api::schema::Method::PaneReportAgentSession(
+                    api::schema::PaneReportAgentSessionParams {
+                        pane_id: public_pane_id.clone(),
+                        origin_pid,
+                        source: "herdr:codex".into(),
+                        agent: "codex".into(),
+                        seq: None,
+                        agent_session_id: Some("old".into()),
+                        agent_session_path: Some(
+                            std::env::temp_dir().join("old.jsonl").display().to_string(),
+                        ),
+                        session_start_source: Some("startup".into()),
+                    },
+                ),
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        });
+        let response: serde_json::Value =
+            serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], "agent_session_stale");
+        let terminal = &server.app.state.terminals[&terminal_id];
+        assert_eq!(
+            terminal
+                .codex_session
+                .as_ref()
+                .unwrap()
+                .registration
+                .session_id,
+            "current"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .unwrap()
+                .session_ref
+                .value,
+            "current"
+        );
     }
 }
 

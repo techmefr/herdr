@@ -3053,6 +3053,14 @@
                 "null"
               ]
             },
+            "origin_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
             },

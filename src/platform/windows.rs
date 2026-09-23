@@ -1387,6 +1387,11 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     select_pane_foreground_job_cached(child_pid)
 }
 
+pub fn foreground_job_fresh(child_pid: u32) -> Option<ForegroundJob> {
+    let snapshot = fresh_foreground_processes();
+    select_pane_foreground_job_from_snapshot_uncached(child_pid, &snapshot)
+}
+
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
     let snapshot = ProcessSnapshot::new(snapshot_processes());
     available_pane_shell_from_snapshot(child_pid, &snapshot)
@@ -1648,6 +1653,34 @@ fn fresh_foreground_processes() -> Arc<ProcessSnapshot> {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     cache.snapshot(Duration::ZERO, snapshot_processes)
+}
+
+pub fn process_is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
+    let snapshot = fresh_foreground_processes();
+    let Some(process) = snapshot.entry(pid) else {
+        return false;
+    };
+    let Some(ancestor) = snapshot.entry(ancestor_pid) else {
+        return false;
+    };
+    let Some(process_identity) = ProcessIdentity::open(pid) else {
+        return false;
+    };
+    let Some(ancestor_identity) = ProcessIdentity::open(ancestor_pid) else {
+        return false;
+    };
+    let (Some(process_start), Some(ancestor_start)) = (
+        process_identity.creation_time(),
+        ancestor_identity.creation_time(),
+    ) else {
+        return false;
+    };
+    process_identity.running()
+        && ancestor_identity.running()
+        && process.command().creation_time == Some(process_start)
+        && ancestor.command().creation_time == Some(ancestor_start)
+        && ancestor_start <= process_start
+        && process_is_ancestor(ancestor_pid, pid, &snapshot)
 }
 
 fn prepare_cached_foreground_selection(
@@ -3634,6 +3667,20 @@ mod tests {
     }
 
     #[test]
+    fn hook_origin_must_descend_from_current_codex_not_shared_pane_shell() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            test_entry(21, 20, "powershell.exe", &["powershell.exe"]),
+            test_entry(30, 10, "codex.exe", &["codex.exe"]),
+            test_entry(31, 30, "powershell.exe", &["powershell.exe"]),
+        ]);
+        assert!(super::process_is_ancestor(10, 21, &snapshot));
+        assert!(!super::process_is_ancestor(30, 21, &snapshot));
+        assert!(super::process_is_ancestor(30, 31, &snapshot));
+    }
+
+    #[test]
     fn windows_process_tree_still_inspects_unusual_escaped_argv0() {
         let snapshot = super::ProcessSnapshot::new(vec![
             test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
@@ -3858,13 +3905,27 @@ mod tests {
         });
         let refreshed = cache.snapshot(Duration::ZERO, || {
             builds += 1;
-            vec![test_entry(20, 1, "pwsh.exe", &["pwsh.exe"])]
+            vec![
+                test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+                test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            ]
         });
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&second, &refreshed));
         assert_eq!(builds, 2);
-        assert_eq!(refreshed.entries[0].pid, 20);
+        assert_eq!(
+            super::select_pane_foreground_job_from_snapshot_uncached(10, &second)
+                .unwrap()
+                .process_group_id,
+            10
+        );
+        assert_eq!(
+            super::select_pane_foreground_job_from_snapshot_uncached(10, &refreshed)
+                .unwrap()
+                .process_group_id,
+            20
+        );
     }
 
     #[test]

@@ -1578,14 +1578,77 @@ impl App {
         id: String,
         params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let terminal_id = self.state.workspaces[ws_idx].terminal_id(pane_id);
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        let codex_report = params.source == "herdr:codex" && agent_label == "codex";
+        let transcript_admitted = codex_report && params.origin_pid.is_some();
+        if transcript_admitted {
+            // Hook admission needs current process evidence, even if detection cached a shell-only snapshot.
+            let foreground_job = terminal_id
+                .and_then(|id| self.terminal_runtimes.get(id))
+                .and_then(|runtime| runtime.child_pid())
+                .and_then(crate::platform::foreground_job_fresh);
+            let origin_pid = params.origin_pid.unwrap_or_default();
+            let origin_matches = foreground_job.as_ref().is_some_and(|job| {
+                job.processes.iter().any(|process| {
+                    let candidate = crate::platform::ForegroundJob {
+                        process_group_id: process.pid,
+                        processes: vec![process.clone()],
+                    };
+                    crate::detect::identify_agent_in_job(&candidate)
+                        .is_some_and(|(agent, _)| agent == crate::detect::Agent::Codex)
+                        && crate::platform::process_is_descendant_of(origin_pid, process.pid)
+                })
+            });
+            if !origin_matches {
+                return encode_error(
+                    id,
+                    "agent_session_stale",
+                    "the Codex hook did not come from the current process",
+                );
+            }
+            if terminal_id
+                .and_then(|id| self.state.terminals.get(id))
+                .is_some_and(|terminal| terminal.needs_codex_process_acquisition())
+            {
+                // SessionStart may beat the detector after a same-shell relaunch.
+                self.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+                    pane_id,
+                    agent: crate::detect::Agent::Codex,
+                    observed_at: std::time::Instant::now(),
+                });
+            }
+        } else if codex_report
+            && terminal_id
+                .and_then(|id| self.state.terminals.get(id))
+                .and_then(|terminal| terminal.codex_session.as_ref())
+                .is_some_and(|session| {
+                    params.agent_session_id.as_deref()
+                        != Some(session.registration.session_id.as_str())
+                })
+        {
+            return encode_error(
+                id,
+                "agent_session_stale",
+                "a current Codex session is already bound",
+            );
+        }
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
+            // Older identity-only hooks remain valid without transcript authority.
+            transcript_path: transcript_admitted
+                .then(|| {
+                    params
+                        .agent_session_path
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                })
+                .flatten(),
             session_ref: crate::agent_resume::session_ref_from_report(
                 &params.source,
                 &agent_label,

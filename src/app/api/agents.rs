@@ -43,7 +43,7 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
-        self.reconcile_managed_agent_target(&target.target);
+        self.reconcile_managed_agent_target(&target.target, std::time::Instant::now());
         let agent = match self.agent_info_for_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -322,7 +322,17 @@ impl App {
                 osc_progress: &osc_progress,
             },
         );
-        let value = crate::detect::manifest::explain_to_json_value(&explain);
+        let mut value = crate::detect::manifest::explain_to_json_value(&explain);
+        if agent == crate::detect::Agent::Codex
+            && terminal
+                .codex_session
+                .as_ref()
+                .is_some_and(|session| session.turn.is_some())
+        {
+            value["screen_state"] = value["state"].clone();
+            value["state"] = crate::detect::manifest::agent_state_label(terminal.state).into();
+            value["turn_state_source"] = "session_transcript".into();
+        }
 
         encode_success(id, ResponseResult::AgentExplain { explain: value })
     }

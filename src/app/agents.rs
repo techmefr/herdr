@@ -36,9 +36,9 @@ impl App {
             .collect()
     }
 
-    pub(super) fn reconcile_managed_agent_target(&mut self, target: &str) {
+    pub(super) fn reconcile_managed_agent_target(&mut self, target: &str, now: Instant) -> bool {
         let Ok(resolved) = self.resolve_agent_target(target) else {
-            return;
+            return false;
         };
         let Some(terminal_id) = self
             .state
@@ -47,18 +47,38 @@ impl App {
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
             .cloned()
         else {
-            return;
+            return false;
         };
         let changed = self
             .state
             .terminals
             .get_mut(&terminal_id)
-            .is_some_and(|terminal| terminal.reconcile_managed_agent_at(Instant::now(), false));
+            .is_some_and(|terminal| terminal.reconcile_managed_agent_at(now, false));
         if changed {
             self.state.mark_session_dirty();
             self.schedule_session_save();
             self.emit_pane_updated(resolved.ws_idx, resolved.pane_id);
         }
+        changed
+    }
+
+    pub(crate) fn reconcile_due_managed_agents_at(&mut self, now: Instant) -> bool {
+        let due = self
+            .state
+            .terminals
+            .values()
+            .filter(|terminal| {
+                terminal
+                    .next_managed_agent_deadline()
+                    .is_some_and(|deadline| now >= deadline)
+            })
+            .filter_map(|terminal| terminal.agent_name.clone())
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for name in due {
+            changed |= self.reconcile_managed_agent_target(&name, now);
+        }
+        changed
     }
 
     pub(super) fn agent_info_for_target(

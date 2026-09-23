@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::fd::RawFd;
@@ -923,6 +924,27 @@ fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     };
 
     (ret == size).then_some(info)
+}
+
+pub fn process_is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
+    let Some(ancestor) = process_bsdinfo(ancestor_pid) else {
+        return false;
+    };
+    let mut current = pid;
+    let mut visited = HashSet::new();
+    let mut child_start = None;
+    while visited.insert(current) {
+        let Some(info) = process_bsdinfo(current) else {
+            return false;
+        };
+        child_start.get_or_insert((info.pbi_start_tvsec, info.pbi_start_tvusec));
+        if info.pbi_ppid == ancestor_pid {
+            return (ancestor.pbi_start_tvsec, ancestor.pbi_start_tvusec)
+                <= child_start.unwrap_or((info.pbi_start_tvsec, info.pbi_start_tvusec));
+        }
+        current = info.pbi_ppid;
+    }
+    false
 }
 
 fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {

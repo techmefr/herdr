@@ -659,6 +659,36 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     (tpgid > 0).then_some(tpgid as u32)
 }
 
+pub fn process_is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
+    fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.get(stat.rfind(')')? + 2..)?;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if matches!(*fields.first()?, "Z" | "X") {
+            return None;
+        }
+        Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+    }
+
+    let Some((_, ancestor_start)) = parent_and_start(ancestor_pid) else {
+        return false;
+    };
+    let mut current = pid;
+    let mut visited = HashSet::new();
+    let mut child_start = None;
+    while visited.insert(current) {
+        let Some((parent, start)) = parent_and_start(current) else {
+            return false;
+        };
+        child_start.get_or_insert(start);
+        if parent == ancestor_pid {
+            return ancestor_start <= child_start.unwrap_or(start);
+        }
+        current = parent;
+    }
+    false
+}
+
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid as u32)

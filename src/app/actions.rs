@@ -1501,15 +1501,52 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                transcript_path,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    let codex = source == "herdr:codex" && agent_label == "codex";
+                    let mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
-                    )
+                    )?;
+                    if codex {
+                        if let Some(path) = transcript_path {
+                            terminal.register_codex_transcript(path);
+                        }
+                    }
+                    Some(mutation)
+                })
+                .into_iter()
+                .collect(),
+            AppEvent::CodexTurnObserved(observation) => {
+                let pane_id = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| &ws.tabs)
+                    .flat_map(|tab| &tab.panes)
+                    .find_map(|(id, pane)| {
+                        (pane.attached_terminal_id == observation.registration.terminal_id)
+                            .then_some(*id)
+                    });
+                pane_id
+                    .and_then(|pane_id| {
+                        self.update_terminal_state(pane_id, |terminal| {
+                            terminal.observe_codex_turn(observation)
+                        })
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            AppEvent::CodexPromptReady {
+                pane_id,
+                ready,
+                observed_at,
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    terminal.observe_codex_prompt(ready, observed_at)
                 })
                 .into_iter()
                 .collect(),
@@ -1682,7 +1719,11 @@ impl AppState {
         let agent_released = mutation.agent_released;
         let change = mutation.effective_state_change.or(unchanged_change)?;
         let suppress_completion = force_suppress_completion
-            || (change.state == AgentState::Idle && suppress_acquisition_completion);
+            || (change.state == AgentState::Idle
+                && (suppress_acquisition_completion
+                    || self.terminals.get(&terminal_id).is_some_and(
+                        crate::terminal::TerminalState::codex_turn_aborted_effective,
+                    )));
         if change.previous_state != change.state {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
@@ -3169,6 +3210,7 @@ mod tests {
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
                 session_start_source: Some(reason.into()),
+                transcript_path: None,
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {
@@ -3204,6 +3246,152 @@ mod tests {
         assert!(terminal.last_agent_completion_seq.is_none());
         assert!(app.workspaces[1].panes[&pane_id].seen);
         assert!(!app.pending_agent_notifications.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn codex_replay_and_abort_do_not_notify_even_when_a_blocker_delays_idle() {
+        for blocked in [false, true] {
+            let mut app = app_with_workspaces(&["active", "background"]);
+            app.active = Some(0);
+            app.toast_config.delay_seconds = 5;
+            let pane_id = app.workspaces[1].tabs[0].root_pane;
+            let terminal_id = app.workspaces[1].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let at = Instant::now();
+            app.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Codex),
+                state: AgentState::Working,
+                visible_blocker: false,
+                visible_working: true,
+                process_exited: false,
+                observed_at: at,
+            });
+            app.handle_app_event(AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:codex".into(),
+                agent_label: "codex".into(),
+                seq: None,
+                session_ref: crate::agent_resume::AgentSessionRef::id("session"),
+                session_start_source: None,
+                transcript_path: Some(std::env::temp_dir().join("session.jsonl")),
+            });
+            if blocked {
+                app.handle_app_event(AppEvent::StateChanged {
+                    pane_id,
+                    agent: Some(Agent::Codex),
+                    state: AgentState::Blocked,
+                    visible_blocker: true,
+                    visible_working: false,
+                    process_exited: false,
+                    observed_at: at,
+                });
+            }
+            let registration = app.terminals[&terminal_id]
+                .codex_session
+                .as_ref()
+                .unwrap()
+                .registration
+                .clone();
+            let turn_event = |id: &str, phase, replay| {
+                AppEvent::CodexTurnObserved(crate::terminal::codex::Observation {
+                    registration: registration.clone(),
+                    turn: Some(crate::terminal::codex::Turn {
+                        id: id.into(),
+                        phase,
+                    }),
+                    observed_at: Instant::now(),
+                    replay,
+                    unavailable: false,
+                })
+            };
+            app.handle_app_event(turn_event(
+                "historical",
+                crate::terminal::codex::TurnPhase::Completed,
+                true,
+            ));
+            assert_eq!(
+                app.terminals[&terminal_id].state,
+                if blocked {
+                    AgentState::Blocked
+                } else {
+                    AgentState::Idle
+                }
+            );
+            app.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Codex),
+                state: AgentState::Unknown,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+            assert_eq!(app.terminals[&terminal_id].state, AgentState::Idle);
+            assert!(app.terminals[&terminal_id]
+                .last_agent_completion_seq
+                .is_none());
+            assert!(app.workspaces[1].panes[&pane_id].seen);
+            assert!(!app
+                .pending_agent_notifications
+                .get(&pane_id)
+                .is_some_and(|notification| notification.kind == ToastKind::Finished));
+            app.handle_app_event(turn_event(
+                "aborted",
+                crate::terminal::codex::TurnPhase::Active,
+                false,
+            ));
+            app.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Codex),
+                state: AgentState::Blocked,
+                visible_blocker: true,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+            app.handle_app_event(turn_event(
+                "aborted",
+                crate::terminal::codex::TurnPhase::Aborted,
+                false,
+            ));
+            assert_eq!(app.terminals[&terminal_id].state, AgentState::Blocked);
+            app.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Codex),
+                state: AgentState::Unknown,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+            assert_eq!(app.terminals[&terminal_id].state, AgentState::Idle);
+            assert!(app.terminals[&terminal_id]
+                .last_agent_completion_seq
+                .is_none());
+            assert!(app.workspaces[1].panes[&pane_id].seen);
+            assert!(!app
+                .pending_agent_notifications
+                .get(&pane_id)
+                .is_some_and(|notification| notification.kind == ToastKind::Finished));
+            app.handle_app_event(turn_event(
+                "successful",
+                crate::terminal::codex::TurnPhase::Active,
+                false,
+            ));
+            app.handle_app_event(turn_event(
+                "successful",
+                crate::terminal::codex::TurnPhase::Completed,
+                false,
+            ));
+            assert!(app.terminals[&terminal_id]
+                .last_agent_completion_seq
+                .is_some());
+            assert!(!app.workspaces[1].panes[&pane_id].seen);
+            assert!(app.pending_agent_notifications.contains_key(&pane_id));
+            app.assert_invariants_for_test();
+        }
     }
 
     #[test]

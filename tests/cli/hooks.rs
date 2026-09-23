@@ -195,6 +195,13 @@ fn codex_hook_reports_persisted_root_session_and_ignores_ephemeral_or_nested_ses
 
     assert_eq!(request["method"], "pane.report_agent_session");
     assert_eq!(request["params"]["agent_session_id"], "codex-session");
+    assert_eq!(
+        request["params"]["agent_session_path"],
+        "/tmp/codex-session.jsonl"
+    );
+    assert!(request["params"].get("terminal_id").is_none());
+    assert!(request["params"].get("process_group_id").is_none());
+    assert!(request["params"]["origin_pid"].as_u64().is_some());
     assert!(request["params"].get("state").is_none());
 
     let matching_request = run_shell_hook_with_env(

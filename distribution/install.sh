@@ -44,11 +44,6 @@ main() {
     log "fetching latest release manifest..."
     MANIFEST="$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 20 "$MANIFEST_URL")" \
         || err "can't reach ${MANIFEST_URL}. Please try again later; herdr.dev might be down. Who let the sheeps out? baaa."
-    # anchor on the top-level "assets"/"sha256" keys only (exactly 2-space
-    # indented); the manifest also carries a "releases" map with one nested
-    # "assets"/"sha256" pair per historical version, and matching any
-    # indentation here would pick those up instead once a nested block
-    # happens to sort before the top-level one.
     URL="$(printf '%s\n' "$MANIFEST" | awk -v target="\"${TARGET}\"" '
         /^  "assets"[[:space:]]*:/ { in_assets = 1; next }
         in_assets && /^  }/ { exit }
